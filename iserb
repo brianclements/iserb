@@ -1,0 +1,876 @@
+#!/bin/bash
+##----------------
+export script_name=$(basename -a "$0")
+export script_short_desc="
+Helper script for LVM snapshots and local rsync backup."
+export script_mod_date='2017.05.26-14:59'
+export script_version='0.9.3'
+export script_requirements='rsync, lvm' 
+##----------------
+shopt -s extglob ## Needed for arg parsing
+
+## Internal config
+export script_subcommands_args=()
+export script_min_args=2
+export script_is_debug=false                    # print a copy of commands for debugging
+export script_run_cmd_in_debug=false            # runs commands in debug mode
+
+## Script Config
+export timestamp="$(date +%Y%m%d-%H%M)"
+export hostname=$(hostname)
+export backup_list=()
+export backup_list_dir=""                       # set in CLI
+export fs_backup_dir=""                         # set in configureScript()
+export backup_interval="once"
+export backup_interval_name="$(date +%Y/\%m/\%d-%H%M)"
+export is_incremental_backup=false
+export is_making_chrono_links=false
+export rsync_options=()                         # set in configureScript()
+export is_resuming_previous_backup=false
+export is_delay_start=false
+
+## User Settings
+export lvm_snapshot_size="15%ORIGIN"
+export lvm_volume_group="${hostname}-sysvg"
+export lvm_snapshot_mountpoint_base="/mnt/tmp"
+# ----------------------------------------------------------------------------------------------
+
+## Script
+lockInstance() {
+    if $is_delay_start; then
+        local delay=$(shuf -i 1-60 -n 1) ## to help prevent simultaneous locking
+        echo "sleeping $delay seconds to help prevent simultaneous instances..."
+        sleep $delay
+    fi
+    if [[ -f /tmp/iserb.lock ]]; then
+        echo "Error: Another instance of $script_name is currently running on this system. Exiting."
+        exit 1
+    else
+        touch /tmp/iserb.lock
+    fi
+}
+
+unlockInstance() {
+    if [[ -f /tmp/iserb.lock ]]; then
+        rm -f /tmp/iserb.lock
+    fi
+}
+
+fail() {
+    unlockInstance
+    exit 1
+}
+
+run() {
+    # First arg is a single string with command to run
+    # Second arg is a string describing where `run` is being called.
+    # Third arg is additional error message
+    local cmd="${1}"
+    local caller_location="${2}"
+    local fail_msg="${3}"
+    local exit_code=0
+    if $script_is_debug; then
+        if $script_run_cmd_in_debug; then
+            eval "${cmd}" || exit_code=1
+        fi
+        echo -e "\n\n-----------------------------------------------------------"
+        echo "Location: ${caller_location}"
+        echo -e "  Command: \"${cmd}\""
+    else
+        eval "${cmd}" || exit_code=1
+    fi
+    if [[ $exit_code != 0 ]]; then
+        local msg="\n"
+        if $script_is_debug; then
+            msg="Error: the previous command failed."
+        else
+            msg="Error: the command \"${cmd}\" failed."
+            msg="$msg\n$fail_msg"
+        fi
+        echo -e "${msg}"
+        fail
+    fi
+    return $exit_code
+}
+
+configureScript() {
+    backup_list_dir="${script_subcommands_args[0]}"
+    if ! [[ -d "${backup_list_dir}" ]]; then
+        echo -e "Error: Can't find backup symlink list directory \"${backup_list_dir}\""
+        fail
+    fi
+
+    fs_backup_dir="${script_subcommands_args[1]}"
+    if ! [[ -d "${fs_backup_dir}" ]]; then
+        echo -e "Error: backup destination directory \"${fs_backup_dir}\" does not exist. Exiting."
+        fail
+    fi
+
+    if ! [[ -d "${lvm_snapshot_mountpoint_base}" ]] ||\
+        ! [[ -d "/dev/${lvm_volume_group}" ]]; then
+        echo "Configuration error: it looks like the LVM settings are not set correctly for this machine."
+        echo "You have two options:"
+        echo ""
+        echo -e "Either edit the script and set the following variables under the \"User Settings\""
+        echo "section for permanent changes:"
+        echo "  lvm_volume_group"
+        echo "  lvm_snapshot_mountpoint_base"
+        echo ""
+        echo -e "Or set the lvm settings manually via CLI args. See the \"Snapshots\" section in the Help for details."
+        fail
+    fi
+
+    if $script_is_debug; then
+        local msg="Debugging mode enabled:"
+        if $script_run_cmd_in_debug; then
+            msg="${msg} execution enabled."
+        else
+            msg="${msg} execution disabled."
+            rsync_options+=(--dry-run)
+        fi
+        echo "$msg"
+    fi
+
+    if $is_making_chrono_links; then
+        echo "Chronological symlinks enabled."
+    fi
+
+    rsync_options+=(
+        --archive
+        --human-readable
+        --stats
+        --append-verify
+        --delete-excluded
+        --exclude='**/lost+found*/'
+        --exclude='**/*cache*/'
+        --exclude='**/*Cache*/'
+        --exclude='**/*trash*/'
+        --exclude='**/*Trash*/'
+        --exclude='**~'
+        --exclude='/mnt/*/**'
+        --exclude='/media/*/**'
+        --exclude='/run/**'
+        --exclude='/proc/**'
+        --exclude='/dev/**'
+        --exclude='/sys/**'
+        --exclude='**/.gvfs/'
+        )
+}
+
+checkIfRoot() {
+    if ! $script_is_debug; then
+        if [ "$(id -u)" != '0' ]; then
+            echo "Error: this script has to be run as root."
+            fail
+        fi
+    else
+        echo "...skipping root check"
+    fi
+}
+
+backup_is_incremental() {
+    local hardlink_dest="$1"
+    if [[ -d "${hardlink_dest}" ]]; then
+        true
+    else
+        false
+    fi
+}
+
+getDeviceFromMountpoint() {
+    local test_dir="$1"
+    local device_path=""
+    local device=""
+    local device_path_alt=""
+    ## This works most of the time, other times, it shows up not as the volume
+    ## name symlink format (/dev/mapper/hostname--volumegroup-volume) but the target
+    ## device format (/dev/dm-01). I don't think there is a downside to using the 
+    ## symlink targets instead of the named symlinks, I think it's just more clear
+    ## in the log output to have it this way so one doesn't have to go back and check
+    ## which symlinks point to where.
+    device_path=$(df -P "$test_dir" | awk 'NR==2{print $1}')
+    device=$(basename -z "$device_path")
+    ## Device path will exist because only on path per mount, but just checking format.
+    if ! [[ -e "/dev/mapper/${lvm_volume_group}/${device}" ]]; then ## not in our format
+        ## try looking in fstab second. This could get messy with comments, double entries, etc.
+        ## so we check after and fallback to original if not.
+        device_path_alt=$(cat /etc/fstab | grep "$test_dir" | awk '{print $1}')
+        if [[ -e "$device_path_alt" ]]; then 
+            device_path="$device_path_alt"
+        fi
+    fi
+    echo "$device_path"
+}
+
+getNameFromDevice() {
+    local device="$1"
+    local name=""
+    ## Best practice for volume group naming is to hyphenate with the hostname. 
+    ## This can result in device names like this: /dev/mapper/hostname--volumegroup-volume 
+    ## which is what we look for first.
+    name=$(basename -z $device | awk -F "-" '{printf $4}')
+
+    if [[ -z $name ]]; then ## device is named differently with less hyphens, we just keep slicing
+        name=$(basename -z $device | awk -F "-" '{printf $3}')
+    fi
+    if [[ -z $name ]]; then 
+        name=$(basename -z $device | awk -F "-" '{printf $2}')
+    fi
+    if [[ -z $name ]]; then 
+        name=$(basename -z $device | awk -F "-" '{printf $1}')
+    fi
+    echo "$name"
+}
+
+getBackupDirList() {
+    local is_empty_dir=true
+    for dir in ${backup_list_dir}/*; do
+        if [[ -L $dir ]] && [[ -d $dir ]]; then
+            is_empty_dir=false
+            dir=$(readlink -e $dir)
+            if [[ $dir == "/" ]]; then
+                echo "Warning: backing up root not recommended using this script's method; it might catch other mounted filesystems and hang the system. Skipping..."
+                continue
+            fi
+            echo "Directory ${dir} is marked for backup."
+            backup_list+=($dir)
+        fi
+    done
+    if $is_empty_dir; then
+        echo "Error: the backup list directory contained either broken or zero symlinks; nothing to do. Exiting."
+        fail
+    fi
+}
+
+checkIfSnapshotExists() {
+    ## This should only ever fail if two instances are started in the same minute.
+    ## And the sleep delay should make this very rare unless the backups finish quickly.
+    ## In which case we still don't want same-minute snapshots occuring for the same device.
+    if [[ -e $lvm_snapshot_path ]]; then
+        echo -e "Error: the lvm snapshot at \"${lvm_snapshot_path}\" already exists. You are starting instances too quickly."
+        fail
+    fi
+}
+
+checkForFailedBackups() {
+    if [[ -L $lvm_snapshot_lock ]] && [[ -b $lvm_snapshot_lock ]]; then
+        echo -e "Warning: an existing snapshot for \"$backup_dir\" already exists. This probably a sign of a previously failed backup."
+        is_resuming_previous_backup=true
+    fi
+}
+
+reconfigureBackupIntervalName() {
+    local t=${lvm_snapshot_name#"${fs_source_name}-snapshot-"}
+    case "$backup_interval" in
+        once)
+            backup_interval_name="${t:0:4}/${t:4:2}/${t:6:2}-${t:9:4}"
+            ;;
+        month)
+            backup_interval_name="${t:0:4}/${t:4:2}/${t:6:2}"
+            ;;
+        day)
+            backup_interval_name="thismonth/${t:6:2}"
+            ;;
+        hour)
+            backup_interval_name="today/${t:9:2}"
+            ;;
+    esac
+}
+
+snapshotIsMounted() {
+    local test_dir="$1"
+    local snapshot_mnt_test=$(mount | grep -e "$test_dir " 2>&1 >> /dev/null; echo $?)
+    if [[ $snapshot_mnt_test == 0 ]]; then
+        true
+    else
+        false
+    fi
+}
+
+pathIsMountpoint() {
+    local test_dir="$1"
+    mountpoint -q "$test_dir"
+}
+
+createLvmSnapshot() {
+    echo -e "Creating snapshot at \"${lvm_snapshot_path}\""
+    run "lvcreate --snapshot -l ${lvm_snapshot_size} --name ${lvm_snapshot_name} ${fs_source_device}"\
+        "createLvmSnapshot()"\
+        "Could not create lvm snapshot."
+    echo -n "Creating symlink snapshot lock: "
+    run "ln -sfv $lvm_snapshot_path $lvm_snapshot_lock"\
+        "createLvmSnapshot()"\
+        "Could not create symlink lock to existing snapshot."
+}
+
+mountLvmSnapshot() {
+    if snapshotIsMounted $lvm_snapshot_mountpoint; then
+        echo -e "Warning: snapshot \"${lvm_snapshot_path}\" is already mounted. Continuing..."
+    else
+        if [[ -d ${lvm_snapshot_mountpoint} ]]; then
+            echo -e "Warning: snapshot mountpoint directory at \"${lvm_snapshot_mountpoint}\" already exists. Reusing it..."
+        else
+            echo -n "Creating mountpoint directory..."
+            run "mkdir ${lvm_snapshot_mountpoint}"\
+                "mountLvmSnapshot()"\
+                "Could not make snapshot mountpoint directory." &&\
+                echo "Done"
+        fi
+
+        echo -en "Mounting snapshot to \"${lvm_snapshot_mountpoint}\"..."
+        run "mount ${lvm_snapshot_path} ${lvm_snapshot_mountpoint}"\
+            "mountLvmSnapshot()"\
+            "Could not mount snapshot." &&\
+            echo "Done"
+    fi
+}
+
+backupRsync() {
+    local rsync_source_dir="$1"
+    local rsync_backup_dest="$2"
+    local rsync_hlink_dest="$3"
+    local these_rsync_opts="${rsync_options[*]}"
+
+    if backup_is_incremental "${rsync_hlink_dest}"; then
+        these_rsync_opts+=( --delete
+                            --link-dest="${rsync_hlink_dest}" 
+        )
+    else
+        echo "No previous backup detected; doing a full backup."
+    fi
+    these_rsync_opts=$( IFS=$' '; echo "${these_rsync_opts[*]}" )
+
+    if ! [[ -d "${rsync_backup_dest}" ]]; then
+        echo -n "Backup destination directory missing; creating it..."
+        run "mkdir -p ${rsync_backup_dest}"\
+            "backupRsync()"\
+            "Could not make rsync backup destination directory" &&\
+            echo "Done"
+    fi
+
+    echo -e "Copying files from \"${rsync_source_dir}\" to \"${rsync_backup_dest}\"..."
+    run "rsync ${these_rsync_opts} ${rsync_source_dir}/ ${rsync_backup_dest}"\
+        "backupRsync()"\
+        "Could not syncronize files."
+}
+
+createLinks() {
+    local fs_volume_name="$1"
+    local rsync_backup_dest="$2"
+    local rsync_hlink_dest="$3"
+    run "rm -f ${rsync_hlink_dest}"\
+        "createLinks()"\
+        "Could not remove symlink to previous backup."
+
+
+    echo -n "Creating symlink to previous backup: "
+    run "ln -sfv ${rsync_backup_dest} ${rsync_hlink_dest}"\
+        "createLinks()"\
+        "Could not create symlink to previous backup."
+
+    if $is_making_chrono_links; then
+        local chrono_link_dir="${fs_backup_dir}/date/${backup_interval_name}"
+        local chrono_link_target="${chrono_link_dir}/${fs_volume_name}"
+
+        if ! [[ -d "${chrono_link_dir}" ]]; then
+            echo -n "Chronological link destination directory missing; creating it..."
+            run "mkdir -p ${chrono_link_dir}"\
+                "createLinks()"\
+                "Could not make chronological link destination directory" &&\
+                echo "Done"
+        fi
+
+        echo -n "Creating chronological symlinks: "
+        run "ln -sfv ${rsync_backup_dest} ${chrono_link_target}"\
+            "createLinks()"\
+            "Could not create chronological symlink."
+    fi
+}
+
+unmountLvmSnapshot() {
+    echo -n "Unmounting snapshot at \"${lvm_snapshot_mountpoint}\"..."
+
+    run "umount ${lvm_snapshot_mountpoint}"\
+        "unmountLvmSnapshot()"\
+        "Could not unmount snapshot." &&\
+        echo "Done"
+
+    if snapshotIsMounted $lvm_snapshot_mountpoint; then
+        echo -e "Warning: snapshot \"${lvm_snapshot_path}\" is still mounted. Check this manually. Exiting."
+        fail
+    fi
+}
+
+deleteLvmSnapshot() {
+    echo "Deleting snapshot at \"${lvm_snapshot_path}\"..."
+    run "lvremove -f ${lvm_snapshot_path}"\
+        "deleteLvmSnapshot()"\
+        "Could not remove lvm snapshot."
+    echo -n "Deleting temporary snapshot mountpoint at \"${lvm_snapshot_mountpoint}\"..."
+    run "rmdir ${lvm_snapshot_mountpoint}"\
+        "deleteLvmSnapshot()"\
+        "Could not remove snapshot mountpoint directory." &&\
+        echo "Done"
+    run "rm -f $lvm_snapshot_lock"\
+        "deleteLvmSnapshot()"\
+        "Could not remove symlink lock to existing snapshot."
+}
+
+## Args
+parseArgs() {
+    local args=("$@")
+    while (( "${#args}" )); do
+        case "$1" in
+            -@([a-z|A-Z]*))
+                # Switches
+                parseSwitches "$1"
+                ;;
+            --*)
+                # Options
+                parseOptions "$1"
+                ;;
+            *)
+                # Subcommands args stored as an array for later. For more
+                # complicated scripts, sometimes we need to act on the
+                # switches/options or source configuration first before we run
+                # the subcommands.
+                script_subcommands_args=("$@")
+                break
+                ;;
+        esac
+        shift
+        args=("$@")
+    done
+    shopt -u extglob
+    # Check for minimum number of arguments/subcommands beyond switches and options here.
+    if [[ ${#script_subcommands_args[@]} < $script_min_args ]]; then
+        echo "Syntax error: a minimum of $script_min_args arguments required."
+        echo ""
+        usage_short
+        fail
+    fi
+}
+
+parseSwitches() {
+    local switches="$1"
+    switches="${switches:1}"
+    while (( "${#switches}" )); do
+        # Handle actions for individual switches here
+        case "${switches:0:1}" in
+            c)
+                is_making_chrono_links=true
+                ;;
+            d)
+                script_is_debug=true
+                ;;
+            h)
+                usage_short
+                exit 0
+                ;;
+            s)
+                is_delay_start=true
+                ;;
+            *)
+                echo "Error: "${switches:0:1}" not a valid switch"
+                echo ""
+                usage_short
+                fail
+                ;;
+        esac
+        switches="${switches:1}"
+    done
+}
+
+parseOptions() {
+    local option=( $( IFS='='; echo ${1} ) )
+    local option_keyword=${option[0]:2}
+    # Get value of option if there is any
+    local option_value=${option[@]:1}
+    # Handle actions for individual options here
+    case "${option_keyword}" in
+        chrono)
+            is_making_chrono_links=true
+            ;;
+        debug-exec)
+            script_run_cmd_in_debug=true
+            ;;
+        help)
+            usage
+            exit 0
+            ;;
+        interval)
+            backup_interval="${option_value}"
+            case "${backup_interval}" in
+                once)
+                    true ## set at top
+                    ;;
+                month)
+                    backup_interval_name=$(date +%Y/\%m/\%d)
+                    ;;
+                day)
+                    backup_interval_name=$(date +thismonth/\%d)
+                    ;;
+                hour)
+                    backup_interval_name=$(date +today/\%H)
+                    ;;
+                *)
+                    echo "Error: incorrect backup interval specified. Exiting."
+                    fail
+                    ;;
+            esac
+            ;;
+        lvm-snapshot-size)
+            lvm_snapshot_size="${option_value}"
+            ;;
+        lvm-snapshot-mountpoint-base)
+            lvm_snapshot_mountpoint_base="${option_value}"
+            ;;
+        lvm-volume-group)
+            lvm_volume_group="${option_value}"
+            ;;
+        version)
+            version
+            exit 0
+            ;;
+        *)
+            echo "Error: "${option_keyword}" not a valid option"
+            echo ""
+            usage_short
+            fail
+            ;;
+    esac
+}
+
+## Dialogs
+usage_cli=$(cat <<EOF
+Usage: ${script_name} [<switches>] [<options>] <backup-list-directory> <backup-destination-directory>
+${script_short_desc}
+EOF
+)
+
+usage_args=$(cat <<EOF
+Switches/Options:
+
+    -c|--chrono         Toggle to enable the making of chronographic symlinks
+                        to backups.
+
+    -d                  Toggle to enable debugging mode; print commands instead
+                        of running them. See 'debug-exec' to allow command
+                        execution anyway.
+
+    --debug-exec        Toggle to actually run commands or not in debugging mode.
+
+    --interval[=]       Specify which interval this backup is functioning as. "once" is set
+                        by default. All backups have identical rsync instructions (except 
+                        if the backup is the first occurance or not. See the "Rsync" section.)
+                        but have different naming schemes and dicrectory trees based on when
+                        they run.
+
+                        Note: Be careful about the times in which these are run. The "month"
+                        and "day" intervals can run without typical worry of conflict, as they
+                        never occur on the same day. But the "once" backup could potentially be run
+                        while another backup is in progress. The most caution should be taken 
+                        with the "hour" interval. On any given day, a backup is already running from
+                        either the "month" or "day" interval. Those two could be scheduled at the same
+                        hour of the day, say midnight, while the "hour" interval could occur the
+                        remaining 23 hours of the day starting at 0100.
+                        
+            "once"      <backup-destination-directory>/source/<backup label>/YEAR/MONTH/DAY-TIME
+                        Meant as an anytime or one-off backup. Compatible with backups
+                        using the other labels in the folder structure.
+                                     
+            "month"     <backup-destination-directory>/source/<backup label>/YEAR/MONTH/01
+                        Meant to be scheduled on the first day of every month; represents the
+                        backup for both that month as well as the first backup of the current
+                        month under the "day" interval.
+
+            "day"       <backup-destination-directory>/source/<backup label>/thismonth/DAY
+                        Meant to be scheduled daily starting on the second day of the month. That
+                        months first backup is handled by the "month" interval.
+
+            "hour"      <backup-destination-directory>/source/<backup label>/today/HOUR
+                        Meant to be scheduled hourly as frequently as desired throughout the day.
+
+    --lvm-snapshot-size[=]
+                        Set the size buffer for the LVM snapshot. See the snapshot function of the
+                        "lvcreate" command documentation for more details.
+
+    --lvm-volume-group[=]
+                        Set the name of the volume group to which all LVM functions will occur in.
+                        For now, all partitions to be backed up and temporary snapshots are assumed
+                        to be in the same volume group; multiple are not currently supported.
+
+    --lvm-snapshot-mountpoint-base[=]
+                        Set the location of where the temporary LVM snapshots will be mounted to.
+
+    -s                  For environments that might need it, introduce a random sleep delay between
+                        1-60 seconds to help prevent simultaneous instances of the script and help
+                        one instance become a clear winner to create the lock file.
+
+    --version           Version
+
+    -h|--help           Short|Full help
+EOF
+)
+
+usage_short() {
+    cat <<EOF
+${usage_cli}
+
+${usage_args}
+
+Run '${script_name} --help' for the full help documentation.
+EOF
+}
+
+usage() {
+    cat <<EOF
+${usage_cli}
+
+LVM + Rsync
+
+This script streamlines the process of looking at a source directory, marked by
+following symlinks to it in <backup-list-directory>, determining if that source
+is an LVM mountpoint, snapshoting it if it is, then using rsync to backup files
+from that snapshot to <backup-destination-directory>, then cleaning up all
+temporary snapshots and mountpoints. To keep backup size down, rysync uses hard links from previous backups to reuse
+files on the harddrive that have not changed.
+
+The script has basic resume capability in case of script stoppage or machine
+power outage. If no configuration has changed in between attempts, it will
+reliably resume the backup regardless of whether the backup source involves LVM
+snapshots or just rsync and at any point.
+
+The script also uses a lock file to prevent simultaneous instances (assuming both
+scripts have access to the same system '/tmp' directory).
+
+Source Directories
+    
+    Source directories to be backed up are marked by full-path symlinks to
+    those directories in the <backup-list-directory>. 
+
+    Two key assumptions are made about the source directories:
+    
+        1) That the target of the symlinks is either a mountpoint for a LVM
+        partition or some other normal directory on the root partition, and
+
+        2) That regardless of partition mountpoint or normal directory, it is
+        mounted and accessible by root.
+
+    One such example of <backup-list-directory> with two directories marked for
+    backup via symlinks would be:
+
+    <backup-list-directory>
+    ├── testsource -> /mnt/tmp/testsource
+    └── testsource2 -> /mnt/tmp/testsource2
+
+Backup Structure
+
+    This script has a particular folder heirarchy it uses for the backups it
+    creates.  Within <backup-destination-directory>, it will organize the
+    backups by source (the name derived from their source folder), and then by
+    date.
+
+    Given the above source directories and a backup directory location of
+    '/mnt/tmp/testdestination', if one were to run one backup of each interval,
+    the resulting structure would look like this:
+
+    testdestination
+    └── source
+        ├── testsource
+        │   ├── 2017
+        │   │   └── 04
+        │   │       ├── 01
+        │   │       └── 24-1332
+        │   ├── thismonth
+        │   │   └── 18
+        │   └── today
+        │       └── 14
+        └── testsource2
+            ├── 2017
+            │   └── 04
+            │       ├── 01
+            │       └── 24-1332
+            ├── thismonth
+            │   └── 18
+            └── today
+                └── 14
+
+    Optionally, using the '-c|--chrono' switch, you can enable the creation of
+    an additional folder hierarchy organized by date first, then by source.
+    This is done via symlinks to the originals in the
+    '<backup-destination-directory>/source'.
+
+    testdestination
+    ├── source
+    │   └──[same as above]
+    └── date
+        ├── 2017
+        │   └── 04
+        │       ├── 01
+        │       │   ├── testsource -> /mnt/tmp/testdestination/source/testsource/2017/04/01
+        │       │   └── testsource2 -> /mnt/tmp/testdestination/source/testsource2/2017/04/01
+        │       └── 24-1332
+        │           ├── testsource -> /mnt/tmp/testdestination/source/testsource/2017/04/24-1332
+        │           └── testsource2 -> /mnt/tmp/testdestination/source/testsource2/2017/04/24-1332
+        ├── thismonth
+        │   └── 18
+        │       ├── testsource -> /mnt/tmp/testdestination/source/testsource/thismonth/18
+        │       └── testsource2 -> /mnt/tmp/testdestination/source/testsource2/thismonth/18
+        └── today
+            └── 14
+                ├── testsource -> /mnt/tmp/testdestination/source/testsource/today/14
+                └── testsource2 -> /mnt/tmp/testdestination/source/testsource2/today/14
+ 
+Snapshots
+
+    If the script determines that the target of the symlink is a mountpoint, it
+    will:
+
+        1) Assume it belongs to the volume group 'lvm_volume_group'
+        
+        2) Determine the volume's device path and partition name by searching
+           for it among all mounted devices
+
+        3) Snapshot and mount the partition of 'lvm_snapshot_size' in a
+           temporary location in 'lvm_snapshot_mountpoint_base'
+
+        4) Syncronize using rsync to a folder the same name as it's source
+           partition in <backup-destination-directory>
+
+        5) Unmount and delete the snapshot and its temporary location
+
+        Three internal variables configure the LVM commands. They can be set
+        permanently by editing the script and seting them under the "User
+        Settings" section or manually via CLI options of the same name.
+
+    lvm_snapshot_size
+        This is the size buffer for the LVM snapshot. See the snapshot function
+        of the "lvcreate" command documentation for more details. The default
+        value is a pretty safe and relative value that probably won't need
+        editing: "15%ORIGIN"
+
+    lvm_volume_group
+        This is the name of the volume group to which all LVM functions will
+        occur. The partitions to be snapshot are looked for at
+        '/dev/<lvm_volume_group>/<volume name>' and the snapshot is also created
+        in the <lvm_volume_group> volume group.
+
+    lvm_snapshot_mountpoint_base
+        This is the location where the temporary LVM snapshots will be mounted
+        to while rsync backs up the files. If all goes well, this directory will
+        be deleted when rsync completes. The default value is '/mnt/tmp'. The
+        snapshots are created with relatively unique names derrived from a
+        timestamp down to the minute. 
+    
+Rsync
+
+    Rsync performs the actual file backup tasks with the following default options
+    on a source directory if backed up for the first time:
+    
+        --archive
+        --human-readable
+        --stats
+        --append-verify
+        --delete-excluded
+        --exclude='**/lost+found*/'
+        --exclude='**/*cache*/'
+        --exclude='**/*Cache*/'
+        --exclude='**/*trash*/'
+        --exclude='**/*Trash*/'
+        --exclude='**~'
+        --exclude='/mnt/*/**'
+        --exclude='/media/*/**'
+        --exclude='/run/**'
+        --exclude='/proc/**'
+        --exclude='/dev/**'
+        --exclude='/sys/**'
+        --exclude='**/.gvfs/'
+
+    For all additional backups on that volume, that backup is incremental. Rsync 
+    will use hard links to reuse unchanged files and save on file space. There
+    will be a symbolic link in '<backup-destination-directory>/source/<volume name>'
+    linking to the most recent backup for that volume called '.prev'. If this
+    link exists, then the "--delete" and "--link-dest" options are added to rsync.
+
+Resume
+
+   Symlinks to the actual snapshot devices are used to mark active snapshots
+   within <backup-list-directory> using the naming format: '.testsource.snap'.
+   These files are generated when the snapshot is created and then removed when
+   the snapshot is deleted thereby allowing the script to resume on premature
+   exit.
+   
+${usage_args}
+
+Requirements:
+
+${script_requirements}
+
+Version:
+
+${script_name} version: ${script_version}
+Last modifed on: ${script_mod_date}
+EOF
+}
+
+version() {
+    echo "${script_name} version: ${script_version}"
+    echo "Last modifed on: ${script_mod_date}"
+}
+
+## Sequence 
+main() {
+    set -eo pipefail
+    parseArgs "$@"
+    configureScript
+    lockInstance
+    checkIfRoot
+    getBackupDirList
+    for backup_dir in "${backup_list[@]}"; do
+        if pathIsMountpoint $backup_dir; then
+            local fs_source_device=$(getDeviceFromMountpoint $backup_dir)
+            local fs_source_name=$(getNameFromDevice $fs_source_device)
+            local lvm_snapshot_name="${fs_source_name}-snapshot-${timestamp}"
+            local lvm_snapshot_mountpoint="${lvm_snapshot_mountpoint_base}/${lvm_snapshot_name}"
+            local lvm_snapshot_path="/dev/${lvm_volume_group}/${lvm_snapshot_name}"
+            local lvm_snapshot_lock="${backup_list_dir}/.${fs_source_name}.snap"
+            local rsync_backup_dest="${fs_backup_dir}/source/${fs_source_name}/${backup_interval_name}"
+            local rsync_hlink_dest="${fs_backup_dir}/source/${fs_source_name}/.prev"
+            echo -e "\n---------"
+            echo "$backup_dir is a mountpoint, and it's device is $fs_source_device"
+            checkIfSnapshotExists
+            checkForFailedBackups
+            if $is_resuming_previous_backup; then
+                local resume_snap=$(readlink $lvm_snapshot_lock)
+                echo -e "Reusing existing snapshot at \"$resume_snap\" for \"$backup_dir\"."
+                lvm_snapshot_name=$(basename $resume_snap)
+                lvm_snapshot_mountpoint="${lvm_snapshot_mountpoint_base}/${lvm_snapshot_name}"
+                lvm_snapshot_path="/dev/${lvm_volume_group}/${lvm_snapshot_name}"
+                reconfigureBackupIntervalName
+                rsync_backup_dest="${fs_backup_dir}/source/${fs_source_name}/${backup_interval_name}"
+            else
+                createLvmSnapshot
+            fi
+            mountLvmSnapshot
+            backupRsync "$lvm_snapshot_mountpoint" "$rsync_backup_dest" "$rsync_hlink_dest"
+            createLinks "$fs_source_name" "$rsync_backup_dest" "$rsync_hlink_dest"
+            unmountLvmSnapshot
+            deleteLvmSnapshot
+            is_resuming_previous_backup=false
+        else
+            echo -e "\n---------"
+            echo "$backup_dir is not a mountpoint, won't snapshot before rsync."
+            local fs_source_name=$(basename $backup_dir)
+            local rsync_backup_dest="${fs_backup_dir}/source/${fs_source_name}/${backup_interval_name}"
+            local rsync_hlink_dest="${fs_backup_dir}/source/${fs_source_name}/.prev"
+            backupRsync "$backup_dir" "$rsync_backup_dest" "$rsync_hlink_dest"
+            createLinks "$fs_source_name" "$rsync_backup_dest" "$rsync_hlink_dest"
+        fi
+    done
+    unlockInstance
+    echo "Backup complete."
+}
+
+## Runtime
+main "$@"

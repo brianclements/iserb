@@ -1,0 +1,6 @@
+[Unit]
+Description=Iserb Hourly System Backup
+
+[Service]
+Type=simple
+ExecStart=/mnt/dev/brian/projects/iserb/iserb -s --chrono --interval="hour" /mnt/backup.list /mnt/backup.local
