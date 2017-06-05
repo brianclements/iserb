@@ -3,8 +3,8 @@
 export script_name=$(basename -a "$0")
 export script_short_desc="
 Helper script for LVM snapshots and local rsync backup."
-export script_mod_date='2017.06.05-00:10'
-export script_version='0.9.4'
+export script_mod_date='2017.06.05-01:13'
+export script_version='0.9.5'
 export script_requirements='rsync, lvm' 
 ##----------------
 shopt -s extglob ## Needed for arg parsing
@@ -304,7 +304,7 @@ createLvmSnapshot() {
         "createLvmSnapshot()"\
         "Could not create lvm snapshot."
     echo -n "Creating symlink snapshot lock: "
-    run "ln -sfv $lvm_snapshot_path $lvm_snapshot_lock"\
+    run "ln -nsfv $lvm_snapshot_path $lvm_snapshot_lock"\
         "createLvmSnapshot()"\
         "Could not create symlink lock to existing snapshot."
 }
@@ -364,13 +364,9 @@ createLinks() {
     local fs_volume_name="$1"
     local rsync_backup_dest="$2"
     local rsync_hlink_dest="$3"
-    run "rm -f ${rsync_hlink_dest}"\
-        "createLinks()"\
-        "Could not remove symlink to previous backup."
-
 
     echo -n "Creating symlink to previous backup: "
-    run "ln -sfv ${rsync_backup_dest} ${rsync_hlink_dest}"\
+    run "ln -nsfv ${rsync_backup_dest} ${rsync_hlink_dest}"\
         "createLinks()"\
         "Could not create symlink to previous backup."
 
@@ -387,7 +383,7 @@ createLinks() {
         fi
 
         echo -n "Creating chronological symlinks: "
-        run "ln -sfv ${rsync_backup_dest} ${chrono_link_target}"\
+        run "ln -nsfv ${rsync_backup_dest} ${chrono_link_target}"\
             "createLinks()"\
             "Could not create chronological symlink."
     fi
