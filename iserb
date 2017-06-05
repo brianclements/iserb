@@ -3,8 +3,8 @@
 export script_name=$(basename -a "$0")
 export script_short_desc="
 Helper script for LVM snapshots and local rsync backup."
-export script_mod_date='2017.05.26-14:59'
-export script_version='0.9.3'
+export script_mod_date='2017.06.05-00:10'
+export script_version='0.9.4'
 export script_requirements='rsync, lvm' 
 ##----------------
 shopt -s extglob ## Needed for arg parsing
@@ -28,6 +28,8 @@ export is_making_chrono_links=false
 export rsync_options=()                         # set in configureScript()
 export is_resuming_previous_backup=false
 export is_delay_start=false
+export is_observing_lock=true
+export is_deleting_lock=true
 
 ## User Settings
 export lvm_snapshot_size="15%ORIGIN"
@@ -43,15 +45,19 @@ lockInstance() {
         sleep $delay
     fi
     if [[ -f /tmp/iserb.lock ]]; then
-        echo "Error: Another instance of $script_name is currently running on this system. Exiting."
-        exit 1
+        if $is_observing_lock; then
+            echo "Error: Another instance of $script_name is currently running on this system. Exiting."
+            exit 1
+        else
+            is_deleting_lock=false
+        fi
     else
         touch /tmp/iserb.lock
     fi
 }
 
 unlockInstance() {
-    if [[ -f /tmp/iserb.lock ]]; then
+    if [[ -f /tmp/iserb.lock ]] && $is_deleting_lock; then
         rm -f /tmp/iserb.lock
     fi
 }
@@ -497,6 +503,9 @@ parseOptions() {
         help)
             usage
             exit 0
+            ;;
+        ignore-lock)
+            is_observing_lock=false
             ;;
         interval)
             backup_interval="${option_value}"
