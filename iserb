@@ -3,8 +3,8 @@
 export script_name=$(basename -a "$0")
 export script_short_desc="
 Helper script for LVM snapshots and local rsync backup."
-export script_mod_date='2017.06.05-01:13'
-export script_version='0.9.5'
+export script_mod_date='2017.06.07-00:52'
+export script_version='0.9.6'
 export script_requirements='rsync, lvm' 
 ##----------------
 shopt -s extglob ## Needed for arg parsing
@@ -30,6 +30,7 @@ export is_resuming_previous_backup=false
 export is_delay_start=false
 export is_observing_lock=true
 export is_deleting_lock=true
+export chrono_link_prefix='../../../..'
 
 ## User Settings
 export lvm_snapshot_size="15%ORIGIN"
@@ -276,9 +277,11 @@ reconfigureBackupIntervalName() {
             ;;
         day)
             backup_interval_name="thismonth/${t:6:2}"
+            chrono_link_prefix='../../..'
             ;;
         hour)
             backup_interval_name="today/${t:9:2}"
+            chrono_link_prefix='../../..'
             ;;
     esac
 }
@@ -362,17 +365,19 @@ backupRsync() {
 
 createLinks() {
     local fs_volume_name="$1"
-    local rsync_backup_dest="$2"
+    local link_backup_dest="$2"
     local rsync_hlink_dest="$3"
 
     echo -n "Creating symlink to previous backup: "
-    run "ln -nsfv ${rsync_backup_dest} ${rsync_hlink_dest}"\
+    run "ln -nsfv ./${link_backup_dest} ${rsync_hlink_dest}"\
         "createLinks()"\
         "Could not create symlink to previous backup."
 
     if $is_making_chrono_links; then
         local chrono_link_dir="${fs_backup_dir}/date/${backup_interval_name}"
         local chrono_link_target="${chrono_link_dir}/${fs_volume_name}"
+        local source_backup_dir="${chrono_link_prefix}/source/${fs_volume_name}/${link_backup_dest}"
+        local chrono_prev_link="${fs_backup_dir}/date/.prev"
 
         if ! [[ -d "${chrono_link_dir}" ]]; then
             echo -n "Chronological link destination directory missing; creating it..."
@@ -383,9 +388,13 @@ createLinks() {
         fi
 
         echo -n "Creating chronological symlinks: "
-        run "ln -nsfv ${rsync_backup_dest} ${chrono_link_target}"\
+        run "ln -nsfv ${source_backup_dir} ${chrono_link_target}"\
             "createLinks()"\
-            "Could not create chronological symlink."
+            "Could not create chronological symlink to source."
+
+        run "ln -nsfv ./${link_backup_dest} ${chrono_prev_link}"\
+            "createLinks()"\
+            "Could not create most recent chronological symlink."
     fi
 }
 
@@ -514,9 +523,11 @@ parseOptions() {
                     ;;
                 day)
                     backup_interval_name=$(date +thismonth/\%d)
+                    chrono_link_prefix='../../..'
                     ;;
                 hour)
                     backup_interval_name=$(date +today/\%H)
+                    chrono_link_prefix='../../..'
                     ;;
                 *)
                     echo "Error: incorrect backup interval specified. Exiting."
@@ -859,7 +870,7 @@ main() {
             fi
             mountLvmSnapshot
             backupRsync "$lvm_snapshot_mountpoint" "$rsync_backup_dest" "$rsync_hlink_dest"
-            createLinks "$fs_source_name" "$rsync_backup_dest" "$rsync_hlink_dest"
+            createLinks "$fs_source_name" "$backup_interval_name" "$rsync_hlink_dest"
             unmountLvmSnapshot
             deleteLvmSnapshot
             is_resuming_previous_backup=false
@@ -870,7 +881,7 @@ main() {
             local rsync_backup_dest="${fs_backup_dir}/source/${fs_source_name}/${backup_interval_name}"
             local rsync_hlink_dest="${fs_backup_dir}/source/${fs_source_name}/.prev"
             backupRsync "$backup_dir" "$rsync_backup_dest" "$rsync_hlink_dest"
-            createLinks "$fs_source_name" "$rsync_backup_dest" "$rsync_hlink_dest"
+            createLinks "$fs_source_name" "$backup_interval_name" "$rsync_hlink_dest"
         fi
     done
     unlockInstance
