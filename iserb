@@ -3,8 +3,8 @@
 export script_name=$(basename -a "$0")
 export script_short_desc="
 Helper script for LVM snapshots and local rsync backup."
-export script_mod_date='2017.06.07-00:52'
-export script_version='0.9.6'
+export script_mod_date='2017.06.07-13:00'
+export script_version='0.9.7'
 export script_requirements='rsync, lvm' 
 ##----------------
 shopt -s extglob ## Needed for arg parsing
@@ -544,6 +544,9 @@ parseOptions() {
         lvm-volume-group)
             lvm_volume_group="${option_value}"
             ;;
+        rsync-add-options)
+            rsync_options+=( "${option_value}" )
+            ;;
         version)
             version
             exit 0
@@ -622,6 +625,10 @@ Switches/Options:
     -s                  For environments that might need it, introduce a random sleep delay between
                         1-60 seconds to help prevent simultaneous instances of the script and help
                         one instance become a clear winner to create the lock file.
+
+    --rsync-add-options[=]
+                        Add a single or space separated list (as a single string) of rsync options 
+                        to all occurences of rsync in the script via the cli.
 
     --version           Version
 
