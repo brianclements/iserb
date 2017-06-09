@@ -3,8 +3,8 @@
 export script_name=$(basename -a "$0")
 export script_short_desc="
 Helper script for LVM snapshots and local rsync backup."
-export script_mod_date='2017.06.07-13:00'
-export script_version='0.9.7'
+export script_mod_date='2017.06.08-18:52'
+export script_version='0.9.8'
 export script_requirements='rsync, lvm' 
 ##----------------
 shopt -s extglob ## Needed for arg parsing
