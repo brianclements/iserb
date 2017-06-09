@@ -7,8 +7,6 @@ Usage: iserb [<switches>] [<options>] <backup-list-directory> <backup-destinatio
 
 Helper script for LVM snapshots and local rsync backup.
 
-LVM + Rsync
-
 This script streamlines the process of looking at a source directory, marked by
 following symlinks to it in <backup-list-directory>, determining if that source
 is an LVM mountpoint, snapshoting it if it is, then using rsync to backup files
@@ -151,7 +149,6 @@ Rsync
         --archive
         --human-readable
         --stats
-        --append-verify
         --delete-excluded
         --exclude='**/lost+found*/'
         --exclude='**/*cache*/'
@@ -235,9 +232,17 @@ Switches/Options:
     --lvm-snapshot-mountpoint-base[=]
                         Set the location of where the temporary LVM snapshots will be mounted to.
 
+    --rsync-add-options[=]
+                        Add a single or space separated list (as a single string) of rsync options
+                        to all occurences of rsync in the script via the cli.
+
     -s                  For environments that might need it, introduce a random sleep delay between
                         1-60 seconds to help prevent simultaneous instances of the script and help
                         one instance become a clear winner to create the lock file.
+
+    -t|--timestamps
+                        Display timestamps at start/end of both entire script and individual backup
+                        directories.
 
     --version           Version
 
@@ -249,6 +254,5 @@ rsync, lvm
 
 Version:
 
-iserb version: 0.9.3
-Last modifed on: 2017.05.26-14:59
-```
+iserb version: 0.9.8
+Last modifed on: 2017.06.08-18:52

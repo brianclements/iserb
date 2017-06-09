@@ -668,8 +668,6 @@ usage() {
     cat <<EOF
 ${usage_cli}
 
-LVM + Rsync
-
 This script streamlines the process of looking at a source directory, marked by
 following symlinks to it in <backup-list-directory>, determining if that source
 is an LVM mountpoint, snapshoting it if it is, then using rsync to backup files
