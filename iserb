@@ -147,7 +147,6 @@ configureScript() {
         --archive
         --human-readable
         --stats
-        --append-verify
         --delete-excluded
         --exclude='**/lost+found*/'
         --exclude='**/*cache*/'
@@ -813,7 +812,6 @@ Rsync
         --archive
         --human-readable
         --stats
-        --append-verify
         --delete-excluded
         --exclude='**/lost+found*/'
         --exclude='**/*cache*/'
