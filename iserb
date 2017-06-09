@@ -385,7 +385,7 @@ createLinks() {
         local chrono_link_dir="${fs_backup_dir}/date/${backup_interval_name}"
         local chrono_link_target="${chrono_link_dir}/${fs_volume_name}"
         local source_backup_dir="${chrono_link_prefix}/source/${fs_volume_name}/${link_backup_dest}"
-        local chrono_prev_link="${fs_backup_dir}/date/.prev"
+        local chrono_current_link="${fs_backup_dir}/date/current"
 
         if ! [[ -d "${chrono_link_dir}" ]]; then
             echo -n "Chronological link destination directory missing; creating it..."
@@ -400,9 +400,9 @@ createLinks() {
             "createLinks()"\
             "Could not create chronological symlink to source."
 
-        run "ln -nsfv ./${link_backup_dest} ${chrono_prev_link}"\
+        run "ln -nsfv ./${link_backup_dest} ${chrono_current_link}"\
             "createLinks()"\
-            "Could not create most recent chronological symlink."
+            "Could not create current chronological symlink."
     fi
 }
 
