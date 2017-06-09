@@ -31,6 +31,7 @@ export is_delay_start=false
 export is_observing_lock=true
 export is_deleting_lock=true
 export chrono_link_prefix='../../../..'
+export is_making_timestamps=false
 
 ## User Settings
 export lvm_snapshot_size="15%ORIGIN"
@@ -162,6 +163,14 @@ configureScript() {
         --exclude='/sys/**'
         --exclude='**/.gvfs/'
         )
+}
+
+timeStamp() {
+    if $is_making_timestamps; then
+        run "date"\
+            "timeStamp()"\
+            "Could not display the time"
+    fi
 }
 
 checkIfRoot() {
@@ -481,6 +490,9 @@ parseSwitches() {
             s)
                 is_delay_start=true
                 ;;
+            t)
+                is_making_timestamps=true
+                ;;
             *)
                 echo "Error: "${switches:0:1}" not a valid switch"
                 echo ""
@@ -546,6 +558,9 @@ parseOptions() {
             ;;
         rsync-add-options)
             rsync_options+=( "${option_value}" )
+            ;;
+        timestamps)
+            is_making_timestamps=true
             ;;
         version)
             version
@@ -622,13 +637,17 @@ Switches/Options:
     --lvm-snapshot-mountpoint-base[=]
                         Set the location of where the temporary LVM snapshots will be mounted to.
 
+    --rsync-add-options[=]
+                        Add a single or space separated list (as a single string) of rsync options 
+                        to all occurences of rsync in the script via the cli.
+
     -s                  For environments that might need it, introduce a random sleep delay between
                         1-60 seconds to help prevent simultaneous instances of the script and help
                         one instance become a clear winner to create the lock file.
 
-    --rsync-add-options[=]
-                        Add a single or space separated list (as a single string) of rsync options 
-                        to all occurences of rsync in the script via the cli.
+    -t|--timestamps
+                        Display timestamps at start/end of both entire script and individual backup
+                        directories.
 
     --version           Version
 
@@ -847,6 +866,7 @@ main() {
     set -eo pipefail
     parseArgs "$@"
     configureScript
+    timeStamp
     lockInstance
     checkIfRoot
     getBackupDirList
@@ -861,6 +881,7 @@ main() {
             local rsync_backup_dest="${fs_backup_dir}/source/${fs_source_name}/${backup_interval_name}"
             local rsync_hlink_dest="${fs_backup_dir}/source/${fs_source_name}/.prev"
             echo -e "\n---------"
+            timeStamp
             echo "$backup_dir is a mountpoint, and it's device is $fs_source_device"
             checkIfSnapshotExists
             checkForFailedBackups
@@ -892,7 +913,8 @@ main() {
         fi
     done
     unlockInstance
-    echo "Backup complete."
+    echo "Backup completed."
+    timeStamp
 }
 
 ## Runtime
